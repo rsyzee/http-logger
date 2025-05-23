@@ -180,14 +180,11 @@ static void hook_handle_socket(struct log_ctx *ctx, int fd, int domain, int type
     if (!g_ctx || g_need_exit)
         return;
 
+    if (!(domain == AF_INET || domain == AF_INET6) || !(type & SOCK_STREAM))
+        return;
+
     try
     {
-        if (!(domain == AF_INET || domain == AF_INET6) || !(type & SOCK_STREAM))
-        {
-            __rm_sock_handle(ctx, fd);
-            return;
-        }
-
         auto sock_ctx = std::make_unique<struct sock_ctx>();
         std::lock_guard<std::mutex> lock(ctx->_mtx);
         auto it = ctx->socks_map.find(fd);
