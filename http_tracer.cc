@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <queue>
 #include <sys/syscall.h>
 #include <netinet/in.h>
@@ -44,50 +45,49 @@ static std::unique_ptr<log_ctx> g_ctx = nullptr;
 static std::mutex g_init_mtx;
 static volatile bool g_need_exit = false;
 
-static void log_exit(void)
+static void log_exit (void)
 {
-    if (g_ctx)
-    {
-        if (g_ctx->file_handle)
-        {
-		    fclose(g_ctx->file_handle);
-		    g_ctx->file_handle = nullptr;
-	    }
+    if (!g_ctx)
+        return;
 
-        g_need_exit = true;
-        g_ctx.reset();
+    if (g_ctx->file_handle)
+    {
+        fclose(g_ctx->file_handle);
+        g_ctx->file_handle = nullptr;
     }
 
+    g_need_exit = true;
+    g_ctx.reset();
 }
 
-static void init_log(void)
+static void init_log (void)
 {
-	try
+    try
     {
-        std::lock_guard<std::mutex> lock(g_init_mtx);
-	    const char *log_file;
+        std::lock_guard<std::mutex> _lock(g_init_mtx);
+        const char *log_file;
 
-		if (g_ctx)
-		    return;
-
-	    log_file = getenv("GWLOG_PATH");
-
-	    if (!log_file)
+        if (g_ctx)
             return;
 
-		g_ctx = std::move(std::make_unique<struct log_ctx>());
-	    g_ctx->file_handle = fopen(log_file, "a");
+        log_file = getenv("GWLOG_PATH");
+        if (!log_file)
+            return;
 
-		if (!g_ctx->file_handle)
+        g_ctx = std::move(std::make_unique<struct log_ctx>());
+        g_ctx->file_handle = fopen(log_file, "a");
+
+        if (!g_ctx->file_handle)
         {
-		    log_exit();
-		    return;
-		}
-	}
+            log_exit();
+            return;
+        }
+    }
     catch (...)
     {
-		log_exit();
-	}
+        log_exit();
+        return;
+    }
 }
 
 static void write_to_file(struct sock_ctx *ctx, struct http_req *req)
