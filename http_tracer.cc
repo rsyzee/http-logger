@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <memory>
 #include <queue>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -13,6 +14,7 @@
 #include <string>
 #include <regex>
 #include <ctime>
+#include <utility>
 
 struct http_req
 {
@@ -166,7 +168,7 @@ static void __rm_sock_handle(struct log_ctx *ctx, int fd)
 {
     auto it = ctx->socks_map.find(fd);
     if (it != ctx->socks_map.end())
-	    ctx->socks_map.erase(it);
+        ctx->socks_map.erase(it);
 }
 
 static void rm_sock_handle(struct log_ctx *ctx, int fd)
@@ -178,24 +180,21 @@ static void rm_sock_handle(struct log_ctx *ctx, int fd)
 static void hook_handle_socket(struct log_ctx *ctx, int fd, int domain, int type)
 {
     if (!g_ctx || g_need_exit)
-	    return;
+        return;
 
     try
     {
-
         if (!(domain == AF_INET || domain == AF_INET6) || !(type & SOCK_STREAM))
         {
             __rm_sock_handle(ctx, fd);
             return;
-
         }
 
         auto sock_ctx = std::make_unique<struct sock_ctx>();
         std::lock_guard<std::mutex> lock(ctx->_mtx);
         auto it = ctx->socks_map.find(fd);
-	    if (it == ctx->socks_map.end())
+        if (it == ctx->socks_map.end())
             ctx->socks_map[fd] = std::move(sock_ctx);
-
     }
     catch (...)
     {
@@ -206,11 +205,10 @@ static void hook_handle_socket(struct log_ctx *ctx, int fd, int domain, int type
 static void hook_handle_connect(struct log_ctx *ctx, int sockfd, const struct sockaddr *addr)
 {
     if (!g_ctx || g_need_exit)
-	    return;
+        return;
 
     try
     {
-
         std::lock_guard<std::mutex> lock(ctx->_mtx);
         auto it = ctx->socks_map.find(sockfd);
         if (it == ctx->socks_map.end())
@@ -246,7 +244,6 @@ static void hook_handle_connect(struct log_ctx *ctx, int sockfd, const struct so
         }
 
         it->second->dst_buf = dst_tmp;
-
     }
     catch (...)
     {
@@ -270,7 +267,7 @@ static void hook_handle_out(struct log_ctx *ctx, int fd, const char *buf, ssize_
         sock_ctx *sock_ctx = it->second.get();
         sock_ctx->send_buf.append(buf, len);
 
-        while (true)
+        while (1)
         {
             struct http_req req;
             size_t endpos;
@@ -300,7 +297,6 @@ static void hook_handle_in(struct log_ctx *ctx, int fd, const char *buf, ssize_t
 
     try
     {
-
         std::lock_guard<std::mutex> lock(ctx->_mtx);
         auto it = ctx->socks_map.find(fd);
         if (it == ctx->socks_map.end())
@@ -373,7 +369,7 @@ int socket(int domain, int type, int protocol)
     else
     {
         if (!g_ctx)
-			init_log();
+            init_log();
 
         hook_handle_socket(g_ctx.get(), ret, domain, type);
     }
@@ -405,15 +401,16 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 
 ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dst_addr, socklen_t addrlen)
 {
+    long ret;
+
     register int __flags __asm__ ("%r10") = flags;
     register const struct sockaddr *__dst_addr __asm__ ("%r8") = dst_addr;
     register socklen_t __addrlen __asm__ ("%r9") = addrlen;
-    long ret;
 
     __asm__ volatile (
         "syscall"
         : "=a" (ret)
-        : "a" (__NR_sendto), "D" (sockfd), "S" (buf), "d" (len), "r" (flags), "r" (__dst_addr), "r" (__addrlen)
+        : "a" (__NR_sendto), "D" (sockfd), "S" (buf), "d" (len), "r" (__flags), "r" (__dst_addr), "r" (__addrlen)
         : "rcx", "r11", "memory"
     );
 
@@ -431,9 +428,10 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct 
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen)
 {
     long ret;
+
     register int __flags __asm__ ("%r10") = flags;
     register struct sockaddr *__src_addr __asm__ ("%r8") = src_addr;
-    register socklen_t *__addrlen __asm__ ("%r9") = addrlen;
+    register socklen_t *__addrlen __asm ("%r9") = addrlen;
 
     __asm__ volatile (
         "syscall"
@@ -519,12 +517,12 @@ int close(int fd)
 
 ssize_t recv(int fd, void *buf, size_t len, int flags)
 {
-	return recvfrom(fd, buf, len, flags, 0, 0);
+    return recvfrom(fd, buf, len, flags, 0, 0);
 }
 
 ssize_t send(int fd, const void *buf, size_t len, int flags)
 {
-	return sendto(fd, buf, len, flags, 0, 0);
+    return sendto(fd, buf, len, flags, 0, 0);
 }
 
 } // extern "C"
