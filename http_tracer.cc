@@ -147,11 +147,9 @@ static size_t parse_http_res(struct sock_ctx *ctx, size_t hdr_end)
     static std::regex cl_hdr(R"(^Content-Length:\s*(\d+))", std::regex::icase | std::regex::optimize);
 
     std::smatch m;
-    size_t n_pos = 0;
 
     if (std::regex_search(ctx->recv_buf, m, code_ret))
     {
-        n_pos = m.position() + m.length();
         ctx->status = stoi(m[1]);
 
         std::string headers = ctx->recv_buf.substr(0, hdr_end);
@@ -258,7 +256,6 @@ static void hook_handle_out(struct log_ctx *ctx, int fd, const char *buf, ssize_
 
     try
     {
-
         std::lock_guard<std::mutex> lock(ctx->_mtx);
         auto it = ctx->socks_map.find(fd);
         if (it == ctx->socks_map.end())
