@@ -1,6 +1,6 @@
 Simple C++ HTTP logger via LD_PRELOAD.
 
-Compile : gcc -lstdc++ -std=c++17 -fPIC -shared -o libhttp_log.so http_tracer.cc
+Compile : gcc -lstdc++ -std=c++17 -fPIC -lpthread -shared -o libhttp_log.so http_tracer.cc
 Usage Ex :
-    env LD_PRELOAD=./libhttp_log.so GWLOG_PATH=/tmp/req_log.txt curl -so /dev/null http://google.com/ccc
-    cat /tmp/req_log.txt
+    - env LD_PRELOAD=./libhttp_log.so GWLOG_PATH=/tmp/req_log.txt curl -so /dev/null http://google.com/ccc
+    - cat /tmp/req_log.txt
