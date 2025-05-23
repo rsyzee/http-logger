@@ -99,61 +99,46 @@ static void write_to_file(struct sock_ctx *ctx, struct http_req *req)
     fprintf(g_ctx.get()->file_handle, "[%s] DST : %s | HOST : %s | REQ : %s %s | RET : %d\n", time_str, ctx->dst_buf.c_str(), req->host.c_str(), req->method.c_str(), req->uri.c_str(), ctx->status);
 }
 
-static bool parse_http_req(struct sock_ctx *ctx, http_req *req, size_t& hdr_end)
+static bool parse_http_req(struct sock_ctx *ctx, http_req *req)
 {
-    static std::regex method_pattern(R"(^(GET|POST|PUT|DELETE|HEAD) (\S+) HTTP/1\.[01]\r\n)");
-    static std::regex host_pattern(R"((?:\r\n|^)Host:\s*([^\r\n]+))", std::regex::icase | std::regex::optimize);
+    static std::regex req_hdr(
+        R"(^([A-Z]+)\s+(\S+)\s+HTTP/1\.[01]\r\n)"  // Method, URI, HTTP version
+        R"([Hh][Oo][Ss][Tt]:\s*([^\r\n]+)\r\n)",    // Host header
+        std::regex::optimize
+    );
 
     std::smatch m;
     const auto& buf = ctx->send_buf;
 
-    if (std::regex_search(buf, m, method_pattern))
+    if (std::regex_search(buf, m, req_hdr))
     {
-        hdr_end = buf.find("\r\n\r\n", m.position() + m.length());
-        if (hdr_end == std::string::npos)
-            return false;
-
-        hdr_end += 4;
-
         req->method = std::move(m[1]);
         req->uri = std::move(m[2]);
+        req->host = std::move(m[3]);
 
-        std::string headers_part = buf.substr(0, hdr_end);
-        std::sregex_iterator it(buf.begin(), buf.end(), host_pattern);
-        std::sregex_iterator end;
-
-        while (it != end)
-        {
-            if (!it->empty())
-            {
-                std::smatch host_match = *it;
-                req->host = (*it)[1].str();
-                return true;
-            }
-
-            it++;
-        }
+        return true;
     }
 
     return false;
 }
 
-static size_t parse_http_res(struct sock_ctx *ctx, size_t hdr_end)
+static size_t parse_http_res(struct sock_ctx *ctx, size_t hdr_len)
 {
-    static std::regex code_ret(R"(HTTP/1\.[01] (\d{3}))");
-    static std::regex cl_hdr(R"(^Content-Length:\s*(\d+))", std::regex::icase | std::regex::optimize);
+    if (hdr_len == 0 || ctx->recv_buf.size() < hdr_len) return -1;
 
+    static std::regex code_ret(R"(HTTP/1\.[01]\s+(\d+)\s+)");
+    static std::regex cl_hdr(R"((?:^|\r\n)Content-Length:\s*(\d+))", std::regex::icase | std::regex::optimize);
     std::smatch m;
 
     if (std::regex_search(ctx->recv_buf, m, code_ret))
     {
         ctx->status = stoi(m[1]);
 
-        std::string headers = ctx->recv_buf.substr(0, hdr_end);
+        std::string headers = ctx->recv_buf.substr(0, hdr_len);
         if (std::regex_search(headers, m, cl_hdr))
             ctx->content_length = stoul(m[1]);
 
-        return hdr_end + ctx->content_length + 4 ;
+        return hdr_len + ctx->content_length;
     }
 
     return -1;
@@ -258,15 +243,19 @@ static void hook_handle_out(struct log_ctx *ctx, int fd, const char *buf, ssize_
         sock_ctx *sock_ctx = it->second.get();
         sock_ctx->send_buf.append(buf, len);
 
+        size_t end = sock_ctx->send_buf.find("\r\n\r\n");
+        if (end == std::string::npos)
+            return;
+
         while (1)
         {
             struct http_req req;
-            size_t endpos;
-            if (parse_http_req(sock_ctx, &req, endpos))
+
+            if (parse_http_req(sock_ctx, &req))
             {
                 req.time_stamp = time(nullptr);
                 sock_ctx->http_req_queue.push(std::move(req));
-                sock_ctx->send_buf.erase(0, endpos);
+                sock_ctx->send_buf.erase(0, end + 4);
             }
             else
             {
@@ -294,27 +283,27 @@ static void hook_handle_in(struct log_ctx *ctx, int fd, const char *buf, ssize_t
             return;
 
         sock_ctx *sock_ctx = it->second.get();
-
         sock_ctx->recv_buf.append(buf, len);
+
+        size_t end_header = sock_ctx->recv_buf.find("\r\n\r\n");
+        if (end_header == std::string::npos)
+            return;
+
+        end_header += 4;
 
         while (1)
         {
-            size_t end_header = sock_ctx->recv_buf.find("\r\n\r\n");
-            if (end_header == std::string::npos)
-                break;
-
             size_t parsed_len = 0;
 
-            if ((parsed_len = parse_http_res(sock_ctx, end_header)) > 0 && !sock_ctx->http_req_queue.empty())
-            {
-                write_to_file(sock_ctx, &sock_ctx->http_req_queue.front());
-                sock_ctx->recv_buf.erase(0, parsed_len);
-                sock_ctx->http_req_queue.pop();
-            }
-            else
-            {
+            if ((parsed_len = parse_http_res(sock_ctx, end_header)) < 0 || sock_ctx->recv_buf.length() < parsed_len)
                 break;
-            }
+
+            if (sock_ctx->http_req_queue.empty())
+                break;
+
+            write_to_file(sock_ctx, &sock_ctx->http_req_queue.front());
+            sock_ctx->http_req_queue.pop();
+            sock_ctx->recv_buf.erase(0, parsed_len);
         }
     }
     catch (...)
@@ -357,14 +346,11 @@ int socket(int domain, int type, int protocol)
         errno = -ret;
         return -1;
     }
-    else
-    {
-        if (!g_ctx)
-            init_log();
 
-        hook_handle_socket(g_ctx.get(), ret, domain, type);
-    }
+    if (!g_ctx)
+        init_log();
 
+    hook_handle_socket(g_ctx.get(), ret, domain, type);
     return ret;
 }
 
@@ -405,14 +391,13 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct 
         : "rcx", "r11", "memory"
     );
 
-    hook_handle_out(g_ctx.get(), sockfd, (const char *)buf, len);
-
     if (ret < 0)
     {
         errno = -ret;
         return -1;
     }
 
+    hook_handle_out(g_ctx.get(), sockfd, (const char *)buf, ret);
     return ret;
 }
 
@@ -431,14 +416,13 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *src_
         : "rcx", "r11", "memory"
     );
 
-    hook_handle_in(g_ctx.get(), fd, (const char *)buf, len);
-
     if (ret < 0)
     {
         errno = -ret;
         return -1;
     }
 
+    hook_handle_in(g_ctx.get(), fd, (const char *)buf, ret);
     return ret;
 }
 
@@ -452,14 +436,13 @@ ssize_t write(int fd, const void* buf, size_t len)
         : "rcx", "r11", "memory"
     );
 
-    hook_handle_out(g_ctx.get(), fd, (const char *)buf, len);
-
     if (ret < 0)
     {
         errno = -ret;
         return -1;
     }
 
+    hook_handle_out(g_ctx.get(), fd, (const char *)buf, ret);
     return ret;
 }
 
@@ -474,14 +457,13 @@ ssize_t read(int fd, void *buf, size_t len)
         : "rcx", "r11", "memory"
     );
 
-    hook_handle_in(g_ctx.get(), fd, (const char *)buf, len);
-
     if (ret < 0)
     {
         errno = -ret;
         return -1;
     }
 
+    hook_handle_in(g_ctx.get(), fd, (const char *)buf, ret);
     return ret;
 }
 
