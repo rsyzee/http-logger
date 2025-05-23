@@ -1,5 +1,3 @@
-#include <asm/unistd_64.h>
-#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -14,7 +12,6 @@
 #include <string>
 #include <regex>
 #include <ctime>
-#include <utility>
 
 struct http_req
 {
@@ -287,7 +284,7 @@ static void hook_handle_out(struct log_ctx *ctx, int fd, const char *buf, ssize_
 static void hook_handle_in(struct log_ctx *ctx, int fd, const char *buf, ssize_t len)
 {
     if (!g_ctx || g_need_exit)
-		return;
+        return;
 
     try
     {
