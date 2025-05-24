@@ -130,7 +130,7 @@ static size_t parse_http_res(struct sock_ctx *ctx, size_t hdr_len)
     static std::regex cl_hdr(R"((?:^|\r\n)Content-Length:\s*(\d+))", std::regex::icase | std::regex::optimize);
     std::smatch m;
 
-	std::string headers = ctx->recv_buf.substr(0, hdr_len - 4);
+    std::string headers = ctx->recv_buf.substr(0, hdr_len -4);
     if (std::regex_search(headers, m, code_ret))
     {
         ctx->status = stoi(m[1]);
@@ -315,7 +315,7 @@ static void hook_handle_in(struct log_ctx *ctx, int fd, const char *buf, size_t 
 void hook_handle_close(struct log_ctx *ctx, int fd)
 {
     if (!g_ctx || g_need_exit)
-	    return;
+        return;
 
     try
     {
