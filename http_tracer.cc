@@ -130,18 +130,17 @@ static size_t parse_http_res(struct sock_ctx *ctx, size_t hdr_len)
     static std::regex cl_hdr(R"((?:^|\r\n)Content-Length:\s*(\d+))", std::regex::icase | std::regex::optimize);
     std::smatch m;
 
-    if (std::regex_search(ctx->recv_buf, m, code_ret))
+	std::string headers = ctx->recv_buf.substr(0, hdr_len - 4);
+    if (std::regex_search(headers, m, code_ret))
     {
         ctx->status = stoi(m[1]);
-
-        std::string headers = ctx->recv_buf.substr(0, hdr_len);
         if (std::regex_search(headers, m, cl_hdr))
             ctx->content_length = stoul(m[1]);
 
         return hdr_len + ctx->content_length;
     }
 
-    return -1;
+    return 0;
 }
 
 static void __rm_sock_handle(struct log_ctx *ctx, int fd)
@@ -188,11 +187,12 @@ static void hook_handle_connect(struct log_ctx *ctx, int sockfd, const struct so
     {
         std::lock_guard<std::mutex> lock(ctx->_mtx);
         auto it = ctx->socks_map.find(sockfd);
+
         if (it == ctx->socks_map.end())
             return;
 
         char ip_str[INET6_ADDRSTRLEN];
-        char dst_tmp[INET6_ADDRSTRLEN + 7];
+        char dst_tmp[INET6_ADDRSTRLEN + 8];
         uint16_t port = 0;
 
         switch (addr->sa_family)
@@ -228,7 +228,7 @@ static void hook_handle_connect(struct log_ctx *ctx, int sockfd, const struct so
     }
 }
 
-static void hook_handle_out(struct log_ctx *ctx, int fd, const char *buf, ssize_t len)
+static void hook_handle_out(struct log_ctx *ctx, int fd, const char *buf, size_t len)
 {
     if (!g_ctx || g_need_exit)
         return;
@@ -270,7 +270,7 @@ static void hook_handle_out(struct log_ctx *ctx, int fd, const char *buf, ssize_
 
 }
 
-static void hook_handle_in(struct log_ctx *ctx, int fd, const char *buf, ssize_t len)
+static void hook_handle_in(struct log_ctx *ctx, int fd, const char *buf, size_t len)
 {
     if (!g_ctx || g_need_exit)
         return;
@@ -295,7 +295,7 @@ static void hook_handle_in(struct log_ctx *ctx, int fd, const char *buf, ssize_t
         {
             size_t parsed_len = 0;
 
-            if ((parsed_len = parse_http_res(sock_ctx, end_header)) < 0 || sock_ctx->recv_buf.length() < parsed_len)
+            if ((parsed_len = parse_http_res(sock_ctx, end_header)) <= 0 || sock_ctx->recv_buf.length() < parsed_len)
                 break;
 
             if (sock_ctx->http_req_queue.empty())
