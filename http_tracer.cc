@@ -122,18 +122,55 @@ static bool parse_http_req(struct sock_ctx *ctx, http_req *req)
 	return false;
 }
 
-static size_t parse_http_res(struct sock_ctx *ctx, size_t hdr_len)
+static size_t parse_http_res(struct sock_ctx *ctx, size_t hdr_len) noexcept
 {
-	if (hdr_len == 0 || ctx->recv_buf.size() < hdr_len) return -1;
+	if (hdr_len == 0 || ctx->recv_buf.size() < hdr_len) return 0;
 
 	static std::regex code_ret(R"(HTTP/1\.[01]\s+(\d+)\s+)");
 	static std::regex cl_hdr(R"((?:^|\r\n)Content-Length:\s*(\d+))", std::regex::icase | std::regex::optimize);
+	static std::regex chunked_hdr(R"(Transfer-Encoding:\s*chunked)", std::regex::icase | std::regex::optimize);
+
 	std::smatch m;
 
-	std::string headers = ctx->recv_buf.substr(0, hdr_len -4);
+	std::string headers = ctx->recv_buf.substr(0, hdr_len - 4);
 	if (std::regex_search(headers, m, code_ret))
 	{
 		ctx->status = stoi(m[1]);
+
+		if (std::regex_search(headers, m, chunked_hdr))
+		{
+			size_t chunk_pos = hdr_len;
+			while (1)
+			{
+				size_t size_end_pos = ctx->recv_buf.find("\r\n", chunk_pos);
+				if (size_end_pos == std::string::npos)
+					return 0; //Need more data.
+
+				size_t chunk_size = 0;
+				std::string size_str = ctx->recv_buf.substr(chunk_pos, size_end_pos - chunk_pos);
+
+				try
+				{
+					chunk_size = std::stoul(size_str, nullptr, 16);
+				}
+				catch (...)
+				{
+					return 0;
+				}
+
+				if (chunk_size == 0)
+				{
+					return size_end_pos + 4;
+				}
+
+				size_t next_chunk = size_end_pos + 2 + chunk_size + 2;
+				if (ctx->recv_buf.length() < next_chunk)
+					return 0; //Need more data.
+
+				chunk_pos = next_chunk;
+			}
+		}
+
 		if (std::regex_search(headers, m, cl_hdr))
 			ctx->content_length = stoul(m[1]);
 
@@ -326,7 +363,6 @@ void hook_handle_close(struct log_ctx *ctx, int fd)
 		log_exit();
 	}
 }
-
 
 extern "C" {
 
