@@ -1,17 +1,20 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
-#include <memory>
-#include <queue>
+#include <cstring>
+#include <ctime>
+
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+#include <memory>
+#include <queue>
 #include <unordered_map>
 #include <mutex>
-#include <string>
 #include <regex>
-#include <ctime>
+
 
 struct http_req
 {
@@ -21,26 +24,30 @@ struct http_req
 	std::string uri;
 };
 
+struct http_res
+{
+	int status_code;
+	size_t content_length;
+};
+
 struct sock_ctx
 {
 	std::string send_buf;
 	std::string recv_buf;
 	std::string dst_buf;
 
-	std::queue<struct http_req> http_req_queue;
-
-	int status;
-	size_t content_length;
+	std::queue<struct http_req> req_queue;
+	http_res res_data;
 };
 
 struct log_ctx
 {
 	FILE *file_handle;
 	std::mutex _mtx;
-	std::unordered_map<int, std::unique_ptr<sock_ctx>> socks_map;
+	std::unordered_map<int, std::unique_ptr<struct sock_ctx>> socks_map;
 };
 
-static std::unique_ptr<log_ctx> g_ctx = nullptr;
+static std::unique_ptr<struct log_ctx> g_ctx = nullptr;
 static std::mutex g_init_mtx;
 static volatile bool g_need_exit = false;
 
@@ -96,25 +103,23 @@ static void write_to_file(struct sock_ctx *ctx, struct http_req *req)
 
 	char time_str[20];
 	strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_info);
-	fprintf(g_ctx.get()->file_handle, "[%s] DST : %s | HOST : %s | REQ : %s %s | RET : %d\n", time_str, ctx->dst_buf.c_str(), req->host.c_str(), req->method.c_str(), req->uri.c_str(), ctx->status);
+	fprintf(g_ctx.get()->file_handle, "[%s] DST : %s | HOST : %s | REQ : %s %s | RET : %d\n", time_str, ctx->dst_buf.c_str(), req->host.c_str(), req->method.c_str(), req->uri.c_str(), ctx->res_data.status_code);
 }
 
-static bool parse_http_req(struct sock_ctx *ctx, http_req *req)
+static bool parse_http_req_header(struct sock_ctx *ctx, http_req *req)
 {
-	static std::regex req_hdr(
+	static std::regex req_hdr (
 		R"(^([A-Z]+)\s+(\S+)\s+HTTP/1\.[01]\r\n)"  // Method, URI, HTTP version
 		R"([Hh][Oo][Ss][Tt]:\s*([^\r\n]+)\r\n)",    // Host header
 		std::regex::optimize
 	);
 
-	std::smatch m;
-	const auto& buf = ctx->send_buf;
-
-	if (std::regex_search(buf, m, req_hdr))
+	std::smatch match_rgx;
+	if (std::regex_search(ctx->send_buf, match_rgx, req_hdr))
 	{
-		req->method = std::move(m[1]);
-		req->uri = std::move(m[2]);
-		req->host = std::move(m[3]);
+		req->method = std::move(match_rgx[1]);
+		req->uri = std::move(match_rgx[2]);
+		req->host = std::move(match_rgx[3]);
 
 		return true;
 	}
@@ -122,20 +127,19 @@ static bool parse_http_req(struct sock_ctx *ctx, http_req *req)
 	return false;
 }
 
-static size_t parse_http_res(struct sock_ctx *ctx, size_t hdr_len) noexcept
+static size_t parse_http_res_header(struct sock_ctx *ctx, size_t hdr_len) noexcept
 {
 	if (hdr_len == 0 || ctx->recv_buf.size() < hdr_len) return 0;
 
-	static std::regex code_ret(R"(HTTP/1\.[01]\s+(\d+)\s+)");
+	static std::regex code_ret(R"(HTTP/1\.[01]\s+(\d+)\s+)", std::regex::optimize);
 	static std::regex cl_hdr(R"((?:^|\r\n)Content-Length:\s*(\d+))", std::regex::icase | std::regex::optimize);
 	static std::regex chunked_hdr(R"(Transfer-Encoding:\s*chunked)", std::regex::icase | std::regex::optimize);
 
 	std::smatch m;
-
 	std::string headers = ctx->recv_buf.substr(0, hdr_len - 4);
 	if (std::regex_search(headers, m, code_ret))
 	{
-		ctx->status = stoi(m[1]);
+		ctx->res_data.status_code = stoi(m[1]);
 
 		if (std::regex_search(headers, m, chunked_hdr))
 		{
@@ -172,9 +176,9 @@ static size_t parse_http_res(struct sock_ctx *ctx, size_t hdr_len) noexcept
 		}
 
 		if (std::regex_search(headers, m, cl_hdr))
-			ctx->content_length = stoul(m[1]);
+			ctx->res_data.content_length = stoul(m[1]);
 
-		return hdr_len + ctx->content_length;
+		return hdr_len + ctx->res_data.content_length;
 	}
 
 	return 0;
@@ -228,27 +232,34 @@ static void hook_handle_connect(struct log_ctx *ctx, int sockfd, const struct so
 		if (it == ctx->socks_map.end())
 			return;
 
-		char ip_str[INET6_ADDRSTRLEN];
-		char dst_tmp[INET6_ADDRSTRLEN + 8];
+		auto& dst_buf = it->second->dst_buf;
+		dst_buf.resize(INET6_ADDRSTRLEN + 7);
+
 		uint16_t port = 0;
+		size_t len = 0;
 
 		switch (addr->sa_family)
 		{
 			case AF_INET:
 			{
 				auto sa4 = reinterpret_cast<const sockaddr_in*>(addr);
-				inet_ntop(AF_INET, &sa4->sin_addr, ip_str, INET_ADDRSTRLEN);
+				inet_ntop(AF_INET, &sa4->sin_addr, dst_buf.data(), INET_ADDRSTRLEN);
+
 				port = ntohs(sa4->sin_port);
-				snprintf(dst_tmp, sizeof(dst_tmp), "%s:%d", ip_str, port);
+				len = strlen(dst_buf.data());
 			}
 			break;
 
 			case AF_INET6:
 			{
 				auto sa6 = reinterpret_cast<const sockaddr_in6*>(addr);
-				inet_ntop(AF_INET6, &sa6->sin6_addr, ip_str, sizeof(ip_str));
 				port = ntohs(sa6->sin6_port);
-				snprintf(dst_tmp, sizeof(dst_tmp), "[%s]:%d", ip_str, port);
+
+				dst_buf[0] = '[';
+				inet_ntop(AF_INET6, &sa6->sin6_addr, &dst_buf[1], INET6_ADDRSTRLEN);
+				len = strlen(dst_buf.data());
+				dst_buf[len] = ']';
+				len++;
 			}
 			break;
 
@@ -257,7 +268,8 @@ static void hook_handle_connect(struct log_ctx *ctx, int sockfd, const struct so
 			return;
 		}
 
-		it->second->dst_buf = dst_tmp;
+		dst_buf[len] = ':';
+		snprintf(dst_buf.data() + len + 1, dst_buf.length() - len - 1, "%u", port);
 	}
 	catch (...)
 	{
@@ -288,10 +300,10 @@ static void hook_handle_out(struct log_ctx *ctx, int fd, const char *buf, size_t
 		{
 			struct http_req req;
 
-			if (parse_http_req(sock_ctx, &req))
+			if (parse_http_req_header(sock_ctx, &req))
 			{
 				req.time_stamp = time(nullptr);
-				sock_ctx->http_req_queue.push(std::move(req));
+				sock_ctx->req_queue.push(std::move(req));
 				sock_ctx->send_buf.erase(0, end + 4);
 			}
 			else
@@ -332,14 +344,14 @@ static void hook_handle_in(struct log_ctx *ctx, int fd, const char *buf, size_t 
 		{
 			size_t parsed_len = 0;
 
-			if ((parsed_len = parse_http_res(sock_ctx, end_header)) <= 0 || sock_ctx->recv_buf.length() < parsed_len)
+			if ((parsed_len = parse_http_res_header(sock_ctx, end_header)) <= 0 || sock_ctx->recv_buf.length() < parsed_len)
 				break;
 
-			if (sock_ctx->http_req_queue.empty())
+			if (sock_ctx->req_queue.empty())
 				break;
 
-			write_to_file(sock_ctx, &sock_ctx->http_req_queue.front());
-			sock_ctx->http_req_queue.pop();
+			write_to_file(sock_ctx, &sock_ctx->req_queue.front());
+			sock_ctx->req_queue.pop();
 			sock_ctx->recv_buf.erase(0, parsed_len);
 		}
 	}
