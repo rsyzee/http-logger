@@ -1,9 +1,14 @@
+#include <cctype>
+#include <cerrno>
+#include <csignal>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 
+#include <string>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <netinet/in.h>
@@ -13,8 +18,19 @@
 #include <queue>
 #include <unordered_map>
 #include <mutex>
-#include <regex>
 
+enum eChunkProcState : int
+{
+	eParseLen,
+	eParseData,
+	eParseDone
+};
+
+struct chunk_hdr
+{
+	eChunkProcState ch_state;
+	size_t remaining_length;
+};
 
 struct http_req
 {
@@ -22,19 +38,32 @@ struct http_req
 	std::string host;
 	std::string method;
 	std::string uri;
+
+	struct chunk_hdr chunk_data;
+	bool chunked_body;
+
+	size_t remaining_length;
+	size_t content_length;
 };
 
 struct http_res
 {
+	struct chunk_hdr chunk_data;
+	bool chunked_body;
 	int status_code;
+	size_t remaining_length;
 	size_t content_length;
 };
 
 struct sock_ctx
 {
+	std::mutex _mtx;
 	std::string send_buf;
 	std::string recv_buf;
 	std::string dst_buf;
+
+	bool req_hdr_parsed;
+	bool res_hdr_parsed;
 
 	std::queue<struct http_req> req_queue;
 	http_res res_data;
@@ -44,7 +73,7 @@ struct log_ctx
 {
 	FILE *file_handle;
 	std::mutex _mtx;
-	std::unordered_map<int, std::unique_ptr<struct sock_ctx>> socks_map;
+	std::unordered_map<int, std::shared_ptr<struct sock_ctx>> socks_map;
 };
 
 static std::unique_ptr<struct log_ctx> g_ctx = nullptr;
@@ -56,14 +85,16 @@ static void log_exit (void)
 	if (!g_ctx)
 		return;
 
+	g_need_exit = true;
 	if (g_ctx->file_handle)
 	{
 		fclose(g_ctx->file_handle);
 		g_ctx->file_handle = nullptr;
 	}
 
-	g_need_exit = true;
 	g_ctx.reset();
+	g_ctx = nullptr;
+
 }
 
 static void init_log (void)
@@ -88,6 +119,8 @@ static void init_log (void)
 			log_exit();
 			return;
 		}
+
+		setvbuf(g_ctx->file_handle, NULL, _IOLBF, 0);
 	}
 	catch (...)
 	{
@@ -98,90 +131,399 @@ static void init_log (void)
 
 static void write_to_file(struct sock_ctx *ctx, struct http_req *req)
 {
-	struct tm tm_info{};
-	localtime_r(&req->time_stamp, &tm_info);
-
+	struct tm tm_info;
 	char time_str[20];
+
+	localtime_r(&req->time_stamp, &tm_info);
 	strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &tm_info);
-	fprintf(g_ctx.get()->file_handle, "[%s] DST : %s | HOST : %s | REQ : %s %s | RET : %d\n", time_str, ctx->dst_buf.c_str(), req->host.c_str(), req->method.c_str(), req->uri.c_str(), ctx->res_data.status_code);
+	fprintf(g_ctx->file_handle, "[%s] DST : %s | HOST : %s | REQ : %s %s | RET : %d\n",
+		time_str, ctx->dst_buf.data(), req->host.data(), req->method.data(),
+		req->uri.data(), ctx->res_data.status_code);
+
+	ctx->req_queue.pop();
 }
 
-static bool parse_http_req_header(struct sock_ctx *ctx, http_req *req)
+static int parse_http_req_header(struct sock_ctx *ctx, http_req *req)
 {
-	static std::regex req_hdr (
-		R"(^([A-Z]+)\s+(\S+)\s+HTTP/1\.[01]\r\n)"  // Method, URI, HTTP version
-		R"([Hh][Oo][Ss][Tt]:\s*([^\r\n]+)\r\n)",    // Host header
-		std::regex::optimize
-	);
+	char *start = ctx->send_buf.data();
+	size_t current = 0, next = 0, end = (uint64_t)-1;
+	int cnt_line = 0;
 
-	std::smatch match_rgx;
-	if (std::regex_search(ctx->send_buf, match_rgx, req_hdr))
+	while (1)
 	{
-		req->method = std::move(match_rgx[1]);
-		req->uri = std::move(match_rgx[2]);
-		req->host = std::move(match_rgx[3]);
+		cnt_line++;
+		if (end == std::string::npos)
+		{
+			end = ctx->send_buf.find("\r\n\r\n");
+			if (end == std::string::npos)
+				return -1; /* end header. need more data. */
 
-		return true;
+			end += 4;
+			current = 0;
+		}
+		else
+		{
+			current = next;
+			if (!current)
+				return -2;
+		}
+
+		next = ctx->send_buf.find("\r\n", current);
+		if (next == std::string::npos)
+			return -2;
+
+		if (next + 2 == end)
+			break;
+
+		start[next] = '\0'; /* null termination per CRLF */
+		next += 2;
+
+		char* val = strchr(&start[current], ':');
+		/* match on ':' separator ...:xxx */
+		if (cnt_line == 1 && !val)
+		{
+			char *uri = strchr(&start[current], ' ');
+			/* match on xxx[ ]/uri */
+			if (!uri)
+				return -2;
+
+			*uri = '\0'; /* null termination. to parse method */
+			uri++;
+			if (*uri != '/')
+				return -2;
+
+			char *ver = strstr(uri, " HTTP/1.");
+			/* validate HTTP 1.x */
+			if (!ver)
+				return -2;
+
+			*ver = '\0';
+
+			req->method = start + current;
+			req->uri = uri;
+			continue;
+		}
+
+		if (!val || !current)
+			return -2;
+
+		*val = '\0';
+		val++;
+		while (isspace(*val))
+			val++;
+
+		char *key = &start[current];
+
+		if (!strcasecmp("host", key))
+		{
+			req->host = {val, 255};
+		}
+		else if (!strcasecmp("content-length", key))
+		{
+			char *endptr;
+			req->content_length = strtoull(val, &endptr, 10);
+			if (*endptr != '\0')
+				return -2;
+
+		} else if (!strcasecmp(key, "transfer-encoding"))
+		{
+			if (!strcasestr(val, "chunked"))
+			{
+				req->chunked_body = true;
+				req->chunk_data.ch_state = eParseLen;
+			}
+
+			req->content_length = (uint64_t)-1;
+		}
+	}
+
+	req->time_stamp = time(nullptr);
+	ctx->req_queue.push(*req);
+	ctx->send_buf.erase(0, end);
+
+	if (!req->content_length)
+		ctx->req_hdr_parsed = false;
+	else
+		ctx->req_hdr_parsed = true;
+
+	return 1;
+}
+
+static bool validate_http_method_hdr (struct sock_ctx *ctx, size_t len)
+{
+	static const char *methods_pattern[] =
+	{
+		"GET /",
+		"POST /",
+		"PUT /",
+		"HEAD /",
+		"DELETE /",
+		"OPTIONS /",
+		"PATCH /",
+	};
+
+	size_t mlen = 0;
+	for (const auto& c : methods_pattern)
+	{
+		mlen = strlen(c);
+		if (!strncmp(ctx->send_buf.data(), c, len > mlen ? mlen : len))
+			return true;
 	}
 
 	return false;
 }
 
-static size_t parse_http_res_header(struct sock_ctx *ctx, size_t hdr_len) noexcept
+static bool is_hex_char(const char *c)
 {
-	if (hdr_len == 0 || ctx->recv_buf.size() < hdr_len) return 0;
+	for (; *c; c++)
+		if (!std::isxdigit(*c))
+			return false;
 
-	static std::regex code_ret(R"(HTTP/1\.[01]\s+(\d+)\s+)", std::regex::optimize);
-	static std::regex cl_hdr(R"((?:^|\r\n)Content-Length:\s*(\d+))", std::regex::icase | std::regex::optimize);
-	static std::regex chunked_hdr(R"(Transfer-Encoding:\s*chunked)", std::regex::icase | std::regex::optimize);
+	return true;
+}
 
-	std::smatch m;
-	std::string headers = ctx->recv_buf.substr(0, hdr_len - 4);
-	if (std::regex_search(headers, m, code_ret))
+static int parse_chunked_body(std::string& buf, struct chunk_hdr *chunk)
+{
+	if (buf.length() == 0)
+		return -1;
+
+	while (1)
 	{
-		ctx->res_data.status_code = stoi(m[1]);
-
-		if (std::regex_search(headers, m, chunked_hdr))
+		if (chunk->ch_state == eParseLen)
 		{
-			size_t chunk_pos = hdr_len;
-			while (1)
+			char *c, *end = &buf[buf.length()];
+
+			if (buf.length() < 3)
+				return -1;
+
+			c = strchr(buf.data(), '\r');
+			if (!c)
 			{
-				size_t size_end_pos = ctx->recv_buf.find("\r\n", chunk_pos);
-				if (size_end_pos == std::string::npos)
-					return 0; //Need more data.
+				if (buf.length() > 8)
+					return -2;
 
-				size_t chunk_size = 0;
-				std::string size_str = ctx->recv_buf.substr(chunk_pos, size_end_pos - chunk_pos);
+				if (!is_hex_char(&buf[0]))
+					return -2;
 
-				try
-				{
-					chunk_size = std::stoul(size_str, nullptr, 16);
-				}
-				catch (...)
-				{
-					return 0;
-				}
-
-				if (chunk_size == 0)
-				{
-					return size_end_pos + 4;
-				}
-
-				size_t next_chunk = size_end_pos + 2 + chunk_size + 2;
-				if (ctx->recv_buf.length() < next_chunk)
-					return 0; //Need more data.
-
-				chunk_pos = next_chunk;
+				return -1;
 			}
+
+			if (&c[1] >= end)
+				return -1; //expecting LF
+
+			if (c[1] != '\n')
+				return -2;
+
+			*c = '\0';
+			size_t chunk_len;
+
+			try
+			{
+				chunk_len = std::stoul(buf, nullptr, 16);
+			}
+			catch (...)
+			{
+				return -2;
+			}
+
+			if (chunk_len == 0)
+			{
+				chunk->ch_state = eParseDone;
+				buf.erase(0, c - &buf[0] + 2);
+				continue;
+			}
+
+			chunk->remaining_length = chunk_len + 2;
+			buf.erase(0, c - &buf[0]);
+			chunk->ch_state = eParseData;
+			/* size_t next_chunk = c - &buf[0] + 2 + chunk_size + 2; */
 		}
+		else if (chunk->ch_state == eParseData)
+		{
+			if (buf.length() < chunk->remaining_length)
+			{
+				chunk->remaining_length -= buf.length();
+				buf.clear(); /* keep capacity */
+				return -1;
+			}
 
-		if (std::regex_search(headers, m, cl_hdr))
-			ctx->res_data.content_length = stoul(m[1]);
+			buf.erase(chunk->remaining_length);
+			chunk->remaining_length = 0;
+			chunk->ch_state = eParseLen;
+			continue;
+		}
+		else if (chunk->ch_state == eParseDone)
+		{
+			if (buf.length() < 2)
+				return -1;
 
-		return hdr_len + ctx->res_data.content_length;
+			if (buf[0] != '\r' || buf[1] != '\n')
+				return -2;
+
+			buf.erase(0, 2);
+			return 0;
+		}
+		else
+		{
+			return -2;
+		}
+	}
+}
+
+static int parse_http_req_body (struct sock_ctx *ctx)
+{
+	struct http_req *req = &ctx->req_queue.back();
+
+	if (req->chunked_body)
+	{
+		int ret;
+		ret = parse_chunked_body(ctx->send_buf, &req->chunk_data);
+
+		if (ret < 0)
+			return ret;
+
+		ctx->req_hdr_parsed = false;
+		return 0;
 	}
 
+	if (req->remaining_length > ctx->send_buf.length())
+	{
+		req->remaining_length -= ctx->send_buf.length();
+		ctx->send_buf.clear();
+		ctx->send_buf.reserve();
+		ctx->req_hdr_parsed = true;
+		return -1;
+	}
+	else
+	{
+		ctx->send_buf.erase(0, req->remaining_length);
+		ctx->req_hdr_parsed = false; /* reset to parse next header */
+		req->remaining_length = 0;
+		return 0;
+	}
+}
+
+static int parse_http_res_header(struct sock_ctx *ctx, http_res *res)
+{
+	char *start = ctx->recv_buf.data();
+	size_t current = 0, next = 0, end = (uint64_t)-1;
+	int cnt_line = 0;
+
+	while (1)
+	{
+		cnt_line++;
+		if (end == std::string::npos)
+		{
+			end = ctx->recv_buf.find("\r\n\r\n");
+			if (end == std::string::npos)
+				return -1; /* need more data. */
+
+			end += 4;
+			current = 0;
+		}
+		else
+		{
+			current = next;
+			if (!current)
+				return -2;
+		}
+
+		next = ctx->recv_buf.find("\r\n", current);
+		if (next == std::string::npos)
+			return -2;
+
+		if (next + 2 == end)
+			break;
+
+		start[next] = '\0'; /* null termination per line \r\n */
+		next += 2;
+
+		if (cnt_line == 1 && !current)
+		{
+			char *s = strchr(&start[current], ' ');
+			if (!s)
+				return -2;
+
+			*s = '\0';
+			s++;
+
+			res->status_code = atoi(s);
+			if (res->status_code < 100 || res->status_code > 599)
+				return -2;
+
+			continue;
+		}
+
+		char* val = strchr(&start[current], ':');
+
+		if (!val || !current)
+			return -2;
+
+		*val = '\0';
+		val++;
+		while (isspace(*val))
+			val++;
+
+		char *key = &start[current];
+
+		if (!strcasecmp(key, "content-length"))
+		{
+			char *endptr;
+			res->content_length = strtoull(val, &endptr, 10);
+			res->remaining_length = res->content_length;
+			if (*endptr != '\0')
+				return -2;
+		}
+		else if (!strcasecmp(key, "transfer-encoding"))
+		{
+			if (strcasestr(val, "chunked"))
+			{
+				res->chunked_body = true;
+				res->chunk_data.ch_state = eParseLen;
+			}
+
+			res->content_length = (uint64_t)-1;
+		}
+	}
+
+	ctx->recv_buf.erase(0, end);
+	if (!res->content_length)
+		ctx->res_hdr_parsed = false;
+	else
+		ctx->res_hdr_parsed = true;
+
 	return 0;
+}
+
+static int parse_http_res_body (struct sock_ctx *ctx, struct http_res *res)
+{
+	if (res->chunked_body)
+	{
+		int ret;
+		ret = parse_chunked_body(ctx->recv_buf, &res->chunk_data);
+
+		if (ret < 0)
+			return ret;
+
+		ctx->res_hdr_parsed = false;
+		return 0;
+	}
+
+	if (res->remaining_length > ctx->recv_buf.length())
+	{
+		res->remaining_length -= ctx->recv_buf.length();
+		ctx->recv_buf.clear();
+		ctx->recv_buf.reserve();
+		ctx->res_hdr_parsed = true;
+		return -1;
+	}
+	else
+	{
+		ctx->recv_buf.erase(0, res->remaining_length);
+		ctx->res_hdr_parsed = false; /* reset to parse next header */
+		res->remaining_length = 0;
+		return 0;
+	}
 }
 
 static void __rm_sock_handle(struct log_ctx *ctx, int fd)
@@ -197,12 +539,15 @@ static void rm_sock_handle(struct log_ctx *ctx, int fd)
 	__rm_sock_handle(ctx, fd);
 }
 
-static void hook_handle_socket(struct log_ctx *ctx, int fd, int domain, int type)
+static void __handle_socket(struct log_ctx *ctx, int fd, int domain, int type)
 {
 	if (!g_ctx || g_need_exit)
 		return;
 
-	if (!(domain == AF_INET || domain == AF_INET6) || !(type & SOCK_STREAM))
+	if (!(domain == AF_INET || domain == AF_INET6))
+		return;
+
+	if (!(type & SOCK_STREAM))
 		return;
 
 	try
@@ -219,20 +564,31 @@ static void hook_handle_socket(struct log_ctx *ctx, int fd, int domain, int type
 	}
 }
 
-static void hook_handle_connect(struct log_ctx *ctx, int sockfd, const struct sockaddr *addr)
+static void __handle_connect(struct log_ctx *ctx, int sockfd,
+				const struct sockaddr *addr, int ret)
 {
 	if (!g_ctx || g_need_exit)
 		return;
 
+	if (ret != 0 && ret != -EINPROGRESS)
+		return;
+
 	try
 	{
-		std::lock_guard<std::mutex> lock(ctx->_mtx);
-		auto it = ctx->socks_map.find(sockfd);
+		std::shared_ptr<struct sock_ctx> sock_ctx;
+		{
+			std::lock_guard<std::mutex> lock(ctx->_mtx);
+			auto it = ctx->socks_map.find(sockfd);
 
-		if (it == ctx->socks_map.end())
-			return;
+			if (it == ctx->socks_map.end())
+				return;
 
-		auto& dst_buf = it->second->dst_buf;
+			sock_ctx = it->second;
+		}
+
+		std::lock_guard<std::mutex> lock(sock_ctx->_mtx);
+
+		auto& dst_buf = sock_ctx->dst_buf;
 		dst_buf.resize(INET6_ADDRSTRLEN + 7);
 
 		uint16_t port = 0;
@@ -264,7 +620,7 @@ static void hook_handle_connect(struct log_ctx *ctx, int sockfd, const struct so
 			break;
 
 			default:
-			ctx->socks_map.erase(it);
+			rm_sock_handle(ctx, sockfd);
 			return;
 		}
 
@@ -277,38 +633,66 @@ static void hook_handle_connect(struct log_ctx *ctx, int sockfd, const struct so
 	}
 }
 
-static void hook_handle_out(struct log_ctx *ctx, int fd, const char *buf, size_t len)
+static void __handle_send(struct log_ctx *ctx, int fd, const char *buf, size_t len)
 {
 	if (!g_ctx || g_need_exit)
 		return;
 
 	try
 	{
-		std::lock_guard<std::mutex> lock(ctx->_mtx);
-		auto it = ctx->socks_map.find(fd);
-		if (it == ctx->socks_map.end())
-			return;
-
-		sock_ctx *sock_ctx = it->second.get();
-		sock_ctx->send_buf.append(buf, len);
-
-		size_t end = sock_ctx->send_buf.find("\r\n\r\n");
-		if (end == std::string::npos)
-			return;
-
-		while (1)
+		std::shared_ptr<struct sock_ctx> ref;
 		{
-			struct http_req req;
+			std::lock_guard<std::mutex> lock(ctx->_mtx);
+			auto it = ctx->socks_map.find(fd);
+			if (it == ctx->socks_map.end())
+				return;
 
-			if (parse_http_req_header(sock_ctx, &req))
+			ref = it->second;
+		}
+
+		std::lock_guard<std::mutex> lock(ref->_mtx);
+		sock_ctx *sock_ctx = ref.get();
+
+		sock_ctx->send_buf.append(buf, len);
+		struct http_req req{};
+
+		while (sock_ctx->send_buf.length() > 0)
+		{
+			if (!sock_ctx->req_hdr_parsed)
 			{
-				req.time_stamp = time(nullptr);
-				sock_ctx->req_queue.push(std::move(req));
-				sock_ctx->send_buf.erase(0, end + 4);
+				if (!validate_http_method_hdr(sock_ctx, len))
+				{
+					rm_sock_handle(ctx, fd);
+					return;
+				}
+
+				int ret = 0;
+				ret = parse_http_req_header(sock_ctx, &req);
+
+				if (ret == -1)
+					return;
+
+				if (ret < 0)
+				{
+					rm_sock_handle(ctx, fd);
+					return;
+				}
+
+				continue;
 			}
 			else
 			{
-				break;
+				int ret;
+				ret = parse_http_req_body(sock_ctx);
+
+				if (ret == -1)
+					return;
+
+				if (ret < 0)
+				{
+					rm_sock_handle(ctx, fd);
+					return;
+				}
 			}
 		}
 	}
@@ -316,43 +700,67 @@ static void hook_handle_out(struct log_ctx *ctx, int fd, const char *buf, size_t
 	{
 		log_exit();
 	}
-
 }
 
-static void hook_handle_in(struct log_ctx *ctx, int fd, const char *buf, size_t len)
+static void __handle_recv(struct log_ctx *ctx, int fd, const char *buf, size_t len)
 {
 	if (!g_ctx || g_need_exit)
 		return;
 
 	try
 	{
-		std::lock_guard<std::mutex> lock(ctx->_mtx);
-		auto it = ctx->socks_map.find(fd);
-		if (it == ctx->socks_map.end())
-			return;
-
-		sock_ctx *sock_ctx = it->second.get();
-		sock_ctx->recv_buf.append(buf, len);
-
-		size_t end_header = sock_ctx->recv_buf.find("\r\n\r\n");
-		if (end_header == std::string::npos)
-			return;
-
-		end_header += 4;
-
-		while (1)
+		std::shared_ptr<struct sock_ctx> ref;
 		{
-			size_t parsed_len = 0;
+			std::lock_guard<std::mutex> lock(ctx->_mtx);
+			auto it = ctx->socks_map.find(fd);
+			if (it == ctx->socks_map.end())
+				return;
 
-			if ((parsed_len = parse_http_res_header(sock_ctx, end_header)) <= 0 || sock_ctx->recv_buf.length() < parsed_len)
-				break;
+			ref = it->second;
+		}
 
-			if (sock_ctx->req_queue.empty())
-				break;
+		std::lock_guard<std::mutex> lock(ref->_mtx);
+		sock_ctx *sock_ctx = ref.get();
+		sock_ctx->recv_buf.append(buf, len);
+		struct http_res *res = &sock_ctx->res_data;
 
-			write_to_file(sock_ctx, &sock_ctx->req_queue.front());
-			sock_ctx->req_queue.pop();
-			sock_ctx->recv_buf.erase(0, parsed_len);
+		while (sock_ctx->recv_buf.length() > 0)
+		{
+
+			if (!sock_ctx->res_hdr_parsed)
+			{
+				if (sock_ctx->req_queue.empty())
+					return;
+
+				int ret = 0;
+				ret = parse_http_res_header(sock_ctx, res);
+
+				if (ret == -1)
+					return;
+
+				if (ret < 0)
+				{
+					rm_sock_handle(ctx, fd);
+					return;
+				}
+
+				write_to_file(sock_ctx, &sock_ctx->req_queue.front());
+				continue;
+			}
+			else
+			{
+				int ret;
+				ret = parse_http_res_body(sock_ctx, res);
+
+				if (ret == -1)
+					return;
+
+				if (ret < 0)
+				{
+					rm_sock_handle(ctx, fd);
+					return;
+				}
+			}
 		}
 	}
 	catch (...)
@@ -361,7 +769,7 @@ static void hook_handle_in(struct log_ctx *ctx, int fd, const char *buf, size_t 
 	}
 }
 
-void hook_handle_close(struct log_ctx *ctx, int fd)
+void __handle_close(struct log_ctx *ctx, int fd)
 {
 	if (!g_ctx || g_need_exit)
 		return;
@@ -398,7 +806,8 @@ int socket(int domain, int type, int protocol)
 	if (!g_ctx)
 		init_log();
 
-	hook_handle_socket(g_ctx.get(), ret, domain, type);
+
+	__handle_socket(g_ctx.get(), ret, domain, type);
 	return ret;
 }
 
@@ -414,7 +823,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 	);
 
 
-	hook_handle_connect(g_ctx.get(), sockfd, addr);
+	__handle_connect(g_ctx.get(), sockfd, addr, ret);
 	if (ret < 0)
 	{
 		errno = -ret;
@@ -424,7 +833,8 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)
 	return ret;
 }
 
-ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *dst_addr, socklen_t addrlen)
+ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+				const struct sockaddr *dst_addr, socklen_t addrlen)
 {
 	long ret;
 
@@ -435,7 +845,8 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct 
 	__asm__ volatile (
 		"syscall"
 		: "=a" (ret)
-		: "a" (__NR_sendto), "D" (sockfd), "S" (buf), "d" (len), "r" (__flags), "r" (__dst_addr), "r" (__addrlen)
+		: "a" (__NR_sendto), "D" (sockfd), "S" (buf), "d" (len), "r" (__flags),
+		  "r" (__dst_addr), "r" (__addrlen)
 		: "rcx", "r11", "memory"
 	);
 
@@ -445,11 +856,12 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct 
 		return -1;
 	}
 
-	hook_handle_out(g_ctx.get(), sockfd, (const char *)buf, ret);
+	__handle_send(g_ctx.get(), sockfd, (const char *)buf, ret);
 	return ret;
 }
 
-ssize_t recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen)
+ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
+			 struct sockaddr *src_addr, socklen_t *addrlen)
 {
 	long ret;
 
@@ -460,7 +872,8 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *src_
 	__asm__ volatile (
 		"syscall"
 		: "=a" (ret)
-		: "a" (__NR_recvfrom), "D" (fd), "S" (buf), "d" (len), "r" (__flags), "r" (__src_addr), "r" (__addrlen)
+		: "a" (__NR_recvfrom), "D" (fd), "S" (buf), "d" (len), "r" (__flags),
+		  "r" (__src_addr), "r" (__addrlen)
 		: "rcx", "r11", "memory"
 	);
 
@@ -470,7 +883,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags, struct sockaddr *src_
 		return -1;
 	}
 
-	hook_handle_in(g_ctx.get(), fd, (const char *)buf, ret);
+	__handle_recv(g_ctx.get(), fd, (const char *)buf, ret);
 	return ret;
 }
 
@@ -490,7 +903,7 @@ ssize_t write(int fd, const void* buf, size_t len)
 		return -1;
 	}
 
-	hook_handle_out(g_ctx.get(), fd, (const char *)buf, ret);
+	__handle_send(g_ctx.get(), fd, (const char *)buf, ret);
 	return ret;
 }
 
@@ -511,14 +924,14 @@ ssize_t read(int fd, void *buf, size_t len)
 		return -1;
 	}
 
-	hook_handle_in(g_ctx.get(), fd, (const char *)buf, ret);
+	__handle_recv(g_ctx.get(), fd, (const char *)buf, ret);
 	return ret;
 }
 
 int close(int fd)
 {
 	int ret;
-	hook_handle_close(g_ctx.get(), fd);
+	__handle_close(g_ctx.get(), fd);
 
 	__asm__ volatile (
 		"syscall"
@@ -538,12 +951,12 @@ int close(int fd)
 
 ssize_t recv(int fd, void *buf, size_t len, int flags)
 {
-	return recvfrom(fd, buf, len, flags, 0, 0);
+	return recvfrom(fd, buf, len, flags, nullptr, 0);
 }
 
 ssize_t send(int fd, const void *buf, size_t len, int flags)
 {
-	return sendto(fd, buf, len, flags, 0, 0);
+	return sendto(fd, buf, len, flags, nullptr, 0);
 }
 
 } // extern "C"
