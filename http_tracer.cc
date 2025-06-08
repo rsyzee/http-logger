@@ -1,6 +1,5 @@
 #include <cctype>
 #include <cerrno>
-#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -8,16 +7,16 @@
 #include <cstring>
 #include <ctime>
 
-#include <string>
+#include <unistd.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #include <memory>
+#include <mutex>
+#include <string>
 #include <queue>
 #include <unordered_map>
-#include <mutex>
 
 enum eChunkProcState : int
 {
@@ -32,18 +31,26 @@ struct chunk_hdr
 	size_t remaining_length;
 };
 
+
+/*
+	TODO :
+	Using better buffer management
+	Pre-computed hash table for common headers
+*/
+
 struct http_req
 {
 	time_t time_stamp;
+
+	size_t remaining_length;
+	size_t content_length;
+
 	std::string host;
 	std::string method;
 	std::string uri;
 
 	struct chunk_hdr chunk_data;
 	bool chunked_body;
-
-	size_t remaining_length;
-	size_t content_length;
 };
 
 struct http_res
@@ -146,20 +153,20 @@ static void write_to_file(struct sock_ctx *ctx, struct http_req *req)
 static int parse_http_req_header(struct sock_ctx *ctx, http_req *req)
 {
 	char *start = ctx->send_buf.data();
-	size_t current = 0, next = 0, end = (uint64_t)-1;
+	char *current, *next = NULL, *end = NULL;
 	int cnt_line = 0;
 
 	while (1)
 	{
 		cnt_line++;
-		if (end == std::string::npos)
+		if (!end)
 		{
-			end = ctx->send_buf.find("\r\n\r\n");
-			if (end == std::string::npos)
-				return -1; /* end header. need more data. */
+			end = strstr(start, "\r\n\r\n");
+			if (!end)
+				return -1;
 
 			end += 4;
-			current = 0;
+			current = start;
 		}
 		else
 		{
@@ -168,21 +175,21 @@ static int parse_http_req_header(struct sock_ctx *ctx, http_req *req)
 				return -2;
 		}
 
-		next = ctx->send_buf.find("\r\n", current);
-		if (next == std::string::npos)
+		next = strstr(current, "\r\n");
+		if (!next)
 			return -2;
 
 		if (next + 2 == end)
 			break;
 
-		start[next] = '\0'; /* null termination per CRLF */
+		*next = '\0'; /* null termination per CRLF */
 		next += 2;
 
-		char* val = strchr(&start[current], ':');
+		char* val = strchr(current, ':');
 		/* match on ':' separator ...:xxx */
 		if (cnt_line == 1 && !val)
 		{
-			char *uri = strchr(&start[current], ' ');
+			char *uri = strchr(current, ' ');
 			/* match on xxx[ ]/uri */
 			if (!uri)
 				return -2;
@@ -199,7 +206,7 @@ static int parse_http_req_header(struct sock_ctx *ctx, http_req *req)
 
 			*ver = '\0';
 
-			req->method = start + current;
+			req->method = current;
 			req->uri = uri;
 			continue;
 		}
@@ -212,22 +219,24 @@ static int parse_http_req_header(struct sock_ctx *ctx, http_req *req)
 		while (isspace(*val))
 			val++;
 
-		char *key = &start[current];
+		char *key = current;
 
 		if (!strcasecmp("host", key))
 		{
-			req->host = {val, 255};
+			req->host = val;
 		}
 		else if (!strcasecmp("content-length", key))
 		{
 			char *endptr;
 			req->content_length = strtoull(val, &endptr, 10);
+			req->remaining_length = req->content_length;
+
 			if (*endptr != '\0')
 				return -2;
-
-		} else if (!strcasecmp(key, "transfer-encoding"))
+		}
+		else if (!strcasecmp(key, "transfer-encoding"))
 		{
-			if (!strcasestr(val, "chunked"))
+			if (strcasestr(val, "chunked"))
 			{
 				req->chunked_body = true;
 				req->chunk_data.ch_state = eParseLen;
@@ -238,8 +247,8 @@ static int parse_http_req_header(struct sock_ctx *ctx, http_req *req)
 	}
 
 	req->time_stamp = time(nullptr);
-	ctx->req_queue.push(*req);
-	ctx->send_buf.erase(0, end);
+	ctx->req_queue.push(std::move(*req));
+	ctx->send_buf.erase(0, end - start);
 
 	if (!req->content_length)
 		ctx->req_hdr_parsed = false;
@@ -249,8 +258,11 @@ static int parse_http_req_header(struct sock_ctx *ctx, http_req *req)
 	return 1;
 }
 
-static bool validate_http_method_hdr (struct sock_ctx *ctx, size_t len)
+static int validate_http_method_hdr (struct sock_ctx *ctx, size_t len)
 {
+	if (len == 0)
+		return -1;
+
 	static const char *methods_pattern[] =
 	{
 		"GET /",
@@ -262,15 +274,21 @@ static bool validate_http_method_hdr (struct sock_ctx *ctx, size_t len)
 		"PATCH /",
 	};
 
-	size_t mlen = 0;
+	size_t mlen, cmpl;
 	for (const auto& c : methods_pattern)
 	{
 		mlen = strlen(c);
-		if (!strncmp(ctx->send_buf.data(), c, len > mlen ? mlen : len))
-			return true;
+		cmpl = len > mlen ? mlen : len;
+		if (!memcmp(&ctx->send_buf[0], c, cmpl))
+		{
+			if (cmpl < mlen)
+				return -1;
+
+			return 0;
+		}
 	}
 
-	return false;
+	return -2;
 }
 
 static bool is_hex_char(const char *c)
@@ -309,7 +327,7 @@ static int parse_chunked_body(std::string& buf, struct chunk_hdr *chunk)
 			}
 
 			if (&c[1] >= end)
-				return -1; //expecting LF
+				return -1; /* expecting LF */
 
 			if (c[1] != '\n')
 				return -2;
@@ -343,11 +361,12 @@ static int parse_chunked_body(std::string& buf, struct chunk_hdr *chunk)
 			if (buf.length() < chunk->remaining_length)
 			{
 				chunk->remaining_length -= buf.length();
-				buf.clear(); /* keep capacity */
+				buf.clear();
+				buf.shrink_to_fit();
 				return -1;
 			}
 
-			buf.erase(chunk->remaining_length);
+			buf.erase(0, chunk->remaining_length);
 			chunk->remaining_length = 0;
 			chunk->ch_state = eParseLen;
 			continue;
@@ -390,7 +409,7 @@ static int parse_http_req_body (struct sock_ctx *ctx)
 	{
 		req->remaining_length -= ctx->send_buf.length();
 		ctx->send_buf.clear();
-		ctx->send_buf.reserve();
+		ctx->send_buf.shrink_to_fit();
 		ctx->req_hdr_parsed = true;
 		return -1;
 	}
@@ -406,20 +425,20 @@ static int parse_http_req_body (struct sock_ctx *ctx)
 static int parse_http_res_header(struct sock_ctx *ctx, http_res *res)
 {
 	char *start = ctx->recv_buf.data();
-	size_t current = 0, next = 0, end = (uint64_t)-1;
+	char *current, *next = NULL, *end = NULL;
 	int cnt_line = 0;
 
 	while (1)
 	{
 		cnt_line++;
-		if (end == std::string::npos)
+		if (!end)
 		{
-			end = ctx->recv_buf.find("\r\n\r\n");
-			if (end == std::string::npos)
+			end = strstr(start, "\r\n\r\n");
+			if (!end)
 				return -1; /* need more data. */
 
 			end += 4;
-			current = 0;
+			current = start;
 		}
 		else
 		{
@@ -428,33 +447,35 @@ static int parse_http_res_header(struct sock_ctx *ctx, http_res *res)
 				return -2;
 		}
 
-		next = ctx->recv_buf.find("\r\n", current);
-		if (next == std::string::npos)
+		next = strstr(current, "\r\n");
+		if (!next)
 			return -2;
 
 		if (next + 2 == end)
 			break;
 
-		start[next] = '\0'; /* null termination per line \r\n */
+		*next = '\0'; /* null termination per line \r\n */
 		next += 2;
 
-		if (cnt_line == 1 && !current)
+		char* val = strchr(current, ':');
+		if (cnt_line == 1 && !val)
 		{
-			char *s = strchr(&start[current], ' ');
+			char *s = strchr(current, ' ');
 			if (!s)
 				return -2;
 
 			*s = '\0';
 			s++;
 
-			res->status_code = atoi(s);
+			res->status_code = (s[0] - '0') * 100 +
+							   (s[1] - '0') * 10 +
+							   (s[2] - '0');
+
 			if (res->status_code < 100 || res->status_code > 599)
 				return -2;
 
 			continue;
 		}
-
-		char* val = strchr(&start[current], ':');
 
 		if (!val || !current)
 			return -2;
@@ -464,7 +485,7 @@ static int parse_http_res_header(struct sock_ctx *ctx, http_res *res)
 		while (isspace(*val))
 			val++;
 
-		char *key = &start[current];
+		char *key = current;
 
 		if (!strcasecmp(key, "content-length"))
 		{
@@ -486,7 +507,7 @@ static int parse_http_res_header(struct sock_ctx *ctx, http_res *res)
 		}
 	}
 
-	ctx->recv_buf.erase(0, end);
+	ctx->recv_buf.erase(0, end - start);
 	if (!res->content_length)
 		ctx->res_hdr_parsed = false;
 	else
@@ -513,7 +534,7 @@ static int parse_http_res_body (struct sock_ctx *ctx, struct http_res *res)
 	{
 		res->remaining_length -= ctx->recv_buf.length();
 		ctx->recv_buf.clear();
-		ctx->recv_buf.reserve();
+		ctx->recv_buf.shrink_to_fit();
 		ctx->res_hdr_parsed = true;
 		return -1;
 	}
@@ -655,18 +676,24 @@ static void __handle_send(struct log_ctx *ctx, int fd, const char *buf, size_t l
 
 		sock_ctx->send_buf.append(buf, len);
 		struct http_req req{};
+		auto &buf = sock_ctx->send_buf;
 
-		while (sock_ctx->send_buf.length() > 0)
+		while (buf.length() > 0)
 		{
 			if (!sock_ctx->req_hdr_parsed)
 			{
-				if (!validate_http_method_hdr(sock_ctx, len))
+				int ret;
+				ret = validate_http_method_hdr(sock_ctx, buf.length());
+
+				if (ret == -1)
+					return;
+
+				if (ret < 0)
 				{
 					rm_sock_handle(ctx, fd);
 					return;
 				}
 
-				int ret = 0;
 				ret = parse_http_req_header(sock_ctx, &req);
 
 				if (ret == -1)
@@ -726,7 +753,6 @@ static void __handle_recv(struct log_ctx *ctx, int fd, const char *buf, size_t l
 
 		while (sock_ctx->recv_buf.length() > 0)
 		{
-
 			if (!sock_ctx->res_hdr_parsed)
 			{
 				if (sock_ctx->req_queue.empty())
@@ -786,6 +812,7 @@ void __handle_close(struct log_ctx *ctx, int fd)
 
 extern "C" {
 
+
 int socket(int domain, int type, int protocol)
 {
 	int ret;
@@ -805,7 +832,6 @@ int socket(int domain, int type, int protocol)
 
 	if (!g_ctx)
 		init_log();
-
 
 	__handle_socket(g_ctx.get(), ret, domain, type);
 	return ret;
