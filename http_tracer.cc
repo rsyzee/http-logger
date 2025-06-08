@@ -352,9 +352,10 @@ static int parse_chunked_body(std::string& buf, struct chunk_hdr *chunk)
 			}
 
 			chunk->remaining_length = chunk_len + 2;
-			buf.erase(0, c - &buf[0]);
+			buf.erase(0, c - &buf[0] + 2);
 			chunk->ch_state = eParseData;
 			/* size_t next_chunk = c - &buf[0] + 2 + chunk_size + 2; */
+			continue;
 		}
 		else if (chunk->ch_state == eParseData)
 		{
